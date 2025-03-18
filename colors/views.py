@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from collections import Counter
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from rest_framework.decorators import api_view
 from rest_framework.views import APIView
 from PIL import Image
@@ -10,6 +10,7 @@ from sklearn.cluster import KMeans
 from sklearn.utils import shuffle
 import tempfile
 import os
+from django.shortcuts import render
 
 def extract_colors(image, num_colors=10):
     # Resize image to speed up processing
@@ -162,3 +163,6 @@ class UploadMediaView(APIView):
                 })
         except Exception as e:
             return JsonResponse({"error": str(e)}, status=400)
+
+def home(request):
+    return render(request, 'home.html')

@@ -29,6 +29,10 @@ ALLOWED_HOSTS = [
     'colorchef.onrender.com',
     'localhost',
 ]
+CORS_ALLOWED_ORIGINS = [
+    "https://colorcheffrontend.vercel.app",
+    "http://localhost:3000",
+]
 
 
 # Application definition
