@@ -33,6 +33,8 @@ ALLOWED_HOSTS = [
 ]
 CORS_ALLOWED_ORIGINS = [
     "https://colorcheffrontend.vercel.app",
+    "https://colorchef.fun",
+    "https://www.colorchef.fun",
     "http://localhost:3000",
 ]
 
