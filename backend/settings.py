@@ -25,7 +25,10 @@ SECRET_KEY = 'django-insecure-=&=#^l2tc!dhc#s714q_v$04u!9sb8@6h%cdqni^wkik$74ti+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    'colorchef.onrender.com',
+    'localhost',
+]
 
 
 # Application definition
