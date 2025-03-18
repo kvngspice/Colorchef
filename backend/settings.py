@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -23,11 +24,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-=&=#^l2tc!dhc#s714q_v$04u!9sb8@6h%cdqni^wkik$74ti+'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False') != 'False'
 
 ALLOWED_HOSTS = [
     'colorchef.onrender.com',
     'localhost',
+    '127.0.0.1',
 ]
 CORS_ALLOWED_ORIGINS = [
     "https://colorcheffrontend.vercel.app",
@@ -134,4 +136,8 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Add STATIC_ROOT for production
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
 # Allow all frontend origins (not recommended for production)
