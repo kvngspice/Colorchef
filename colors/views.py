@@ -112,6 +112,30 @@ def extract_colors_from_video(video_path, num_colors=10, total_colors=30, max_fr
     except Exception as e:
         raise Exception(f"Error processing video: {str(e)}")
 
+def optimize_image_for_upload(image, max_dimension=1200):
+    """Resize and optimize image for upload if it's too large"""
+    try:
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Check if resize is needed
+        w, h = image.size
+        if max(w, h) > max_dimension:
+            ratio = max_dimension / max(w, h)
+            new_size = (int(w * ratio), int(h * ratio))
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Save optimized image to bytes
+        img_io = io.BytesIO()
+        image.save(img_io, format='PNG', optimize=True, quality=85)
+        img_io.seek(0)
+        
+        return img_io
+    except Exception as e:
+        print(f"Error optimizing image: {str(e)}")
+        return None
+
 class UploadMediaView(APIView):
     def post(self, request):
         if "file" not in request.FILES:
@@ -119,14 +143,15 @@ class UploadMediaView(APIView):
 
         try:
             file = request.FILES["file"]
+            
+            # Check file size
+            if file.size > 10 * 1024 * 1024:  # 10MB limit
+                return JsonResponse({"error": "File too large. Maximum size is 10MB"}, status=400)
+            
             num_colors = int(request.POST.get('numColors', 4))
             total_colors = 30  # Total colors to extract for shuffling
-            start_time = float(request.POST.get('startTime', 0))
-            end_time = float(request.POST.get('endTime', 5))
             
-            is_video = file.content_type.startswith('video/')
-            
-            if is_video:
+            if file.content_type.startswith('video/'):
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
                     for chunk in file.chunks():
                         tmp_file.write(chunk)
@@ -136,9 +161,7 @@ class UploadMediaView(APIView):
                     colors, reserve_colors, duration = extract_colors_from_video(
                         tmp_path, 
                         num_colors=num_colors,
-                        total_colors=total_colors,
-                        start_time=start_time,
-                        end_time=end_time
+                        total_colors=total_colors
                     )
                     return JsonResponse({
                         "colors": colors,
@@ -152,11 +175,17 @@ class UploadMediaView(APIView):
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
             else:
-                # Handle image as before
+                # Open and optimize image
                 image = Image.open(file)
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
+                optimized_io = optimize_image_for_upload(image)
+                if optimized_io is None:
+                    return JsonResponse({"error": "Failed to process image"}, status=400)
                 
+                # Store optimized image in session or cache for later use
+                request.session['optimized_image'] = optimized_io.getvalue()
+                
+                # Extract colors from optimized image
+                image = Image.open(optimized_io)
                 all_colors, all_regions = extract_colors(image, num_colors=total_colors)
                 
                 return JsonResponse({
@@ -166,7 +195,9 @@ class UploadMediaView(APIView):
                     "reserveRegions": all_regions[num_colors:],
                     "isVideo": False
                 })
+                
         except Exception as e:
+            print(f"Error in upload: {str(e)}")
             return JsonResponse({"error": str(e)}, status=400)
 
 def resize_image_for_processing(img, max_dimension=1200):
@@ -213,10 +244,15 @@ def posterize_image(request):
         pixel_size = int(request.POST.get('pixelSize', 8))
         num_colors = int(request.POST.get('numColors', 8))
         
-        # Open and process image
-        original_img = Image.open(file)
-        if original_img.mode != 'RGB':
-            original_img = original_img.convert('RGB')
+        # Use optimized image if available in session
+        if 'optimized_image' in request.session:
+            img_data = request.session['optimized_image']
+            original_img = Image.open(io.BytesIO(img_data))
+        else:
+            # Fallback to original file
+            original_img = Image.open(file)
+            if original_img.mode != 'RGB':
+                original_img = original_img.convert('RGB')
         
         # Store original dimensions
         original_w, original_h = original_img.size
