@@ -10,12 +10,8 @@ from sklearn.cluster import KMeans
 from sklearn.utils import shuffle
 import tempfile
 import os
-<<<<<<< HEAD
-from django.shortcuts import render
-=======
 import io
 from rest_framework.response import Response
->>>>>>> 9d995fe (new feature)
 
 def extract_colors(image, num_colors=10):
     # Resize image to speed up processing
@@ -169,10 +165,6 @@ class UploadMediaView(APIView):
         except Exception as e:
             return JsonResponse({"error": str(e)}, status=400)
 
-<<<<<<< HEAD
-def home(request):
-    return render(request, 'home.html')
-=======
 def resize_image_for_processing(img, max_dimension=1200):
     """Resize image while maintaining aspect ratio if it's too large"""
     w, h = img.size
@@ -528,4 +520,3 @@ def blend_art(request):
     except Exception as e:
         print(f"Error in blend_art: {str(e)}")
         return Response({'error': str(e)}, status=500)
->>>>>>> 9d995fe (new feature)
