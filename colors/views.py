@@ -203,9 +203,63 @@ def validate_image(file):
     except Exception as e:
         raise ValidationError(f'Invalid image file: {str(e)}')
 
+def process_posterize(img, pixel_size, num_colors):
+    """Process image for posterization"""
+    try:
+        # Convert to RGB if needed
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Store original dimensions
+        original_w, original_h = img.size
+        
+        # Resize for processing if image is too large
+        img = resize_image_for_processing(img)
+        w, h = img.size
+        
+        # Calculate resize ratios
+        w_ratio = original_w / w
+        h_ratio = original_h / h
+        
+        # Adjust pixel size based on ratio
+        adjusted_pixel_size = max(2, int(pixel_size / min(w_ratio, h_ratio)))
+        
+        # Create posterized version
+        small_w = max(1, w // adjusted_pixel_size)
+        small_h = max(1, h // adjusted_pixel_size)
+        img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        
+        # Convert to numpy array for color quantization
+        img_array = np.array(img)
+        pixels = img_array.reshape(-1, 3)
+        pixels = np.float32(pixels)
+        
+        # Perform k-means clustering
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+        flags = cv2.KMEANS_RANDOM_CENTERS
+        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
+        
+        # Convert back to uint8
+        palette = np.uint8(palette)
+        quantized = palette[labels.flatten()]
+        quantized = quantized.reshape(img_array.shape)
+        
+        # Convert back to PIL Image
+        posterized_img = Image.fromarray(quantized)
+        
+        # Resize back to original dimensions
+        posterized_img = posterized_img.resize((original_w, original_h), Image.Resampling.NEAREST)
+        
+        return posterized_img
+        
+    except Exception as e:
+        logger.error(f"Error in process_posterize: {str(e)}")
+        raise ValidationError(f"Failed to process image: {str(e)}")
+
 @api_view(['POST'])
 def posterize_image(request):
     if 'file' not in request.FILES:
+        logger.warning("No file in request")
         return Response({'error': 'No file uploaded'}, status=400)
     
     try:
@@ -225,6 +279,7 @@ def posterize_image(request):
             raise ValidationError('Invalid parameters')
 
         # Process image
+        logger.info(f"Processing image with pixel_size={pixel_size}, num_colors={num_colors}")
         result_img = process_posterize(img, pixel_size, num_colors)
         
         # Return result
