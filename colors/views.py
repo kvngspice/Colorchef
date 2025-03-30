@@ -14,6 +14,7 @@ import io
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,15 @@ def validate_image(file):
     except Exception as e:
         raise ValidationError(f'Invalid image file: {str(e)}')
 
+def get_optimal_dimensions(width, height, max_pixels=1000000):  # 1MP default limit
+    """Calculate optimal dimensions while maintaining aspect ratio"""
+    pixels = width * height
+    if pixels <= max_pixels:
+        return width, height
+        
+    ratio = math.sqrt(max_pixels / pixels)
+    return int(width * ratio), int(height * ratio)
+
 @api_view(['POST'])
 def posterize_image(request):
     if 'file' not in request.FILES:
@@ -244,36 +254,32 @@ def posterize_image(request):
         pixel_size = int(request.POST.get('pixelSize', 8))
         num_colors = int(request.POST.get('numColors', 8))
         
-        # Use optimized image if available in session
-        if 'optimized_image' in request.session:
-            img_data = request.session['optimized_image']
-            original_img = Image.open(io.BytesIO(img_data))
-        else:
-            # Fallback to original file
-            original_img = Image.open(file)
-            if original_img.mode != 'RGB':
-                original_img = original_img.convert('RGB')
+        # Open image
+        original_img = Image.open(file)
+        if original_img.mode != 'RGB':
+            original_img = original_img.convert('RGB')
         
         # Store original dimensions
         original_w, original_h = original_img.size
         
-        # Resize for processing if image is too large
-        img = resize_image_for_processing(original_img)
-        w, h = img.size
+        # Calculate optimal processing dimensions based on image size
+        if original_w * original_h > 1000000:  # If larger than 1MP
+            process_w, process_h = get_optimal_dimensions(original_w, original_h)
+            img = original_img.resize((process_w, process_h), Image.Resampling.LANCZOS)
+        else:
+            img = original_img
+            process_w, process_h = original_w, original_h
         
-        # Calculate resize ratios
-        w_ratio = original_w / w
-        h_ratio = original_h / h
-        
-        # Adjust pixel size based on ratio
-        adjusted_pixel_size = max(2, int(pixel_size / min(w_ratio, h_ratio)))
+        # Adjust pixel size based on resize ratio
+        scale_factor = min(original_w / process_w, original_h / process_h)
+        adjusted_pixel_size = max(2, int(pixel_size / scale_factor))
         
         # Create posterized version
-        small_w = max(1, w // adjusted_pixel_size)
-        small_h = max(1, h // adjusted_pixel_size)
+        small_w = max(1, process_w // adjusted_pixel_size)
+        small_h = max(1, process_h // adjusted_pixel_size)
         img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
         
-        # Convert to numpy array for color quantization
+        # Process colors
         img_array = np.array(img)
         pixels = img_array.reshape(-1, 3)
         pixels = np.float32(pixels)
@@ -283,18 +289,16 @@ def posterize_image(request):
         flags = cv2.KMEANS_RANDOM_CENTERS
         _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
         
-        # Convert back to uint8
+        # Convert back to image
         palette = np.uint8(palette)
         quantized = palette[labels.flatten()]
         quantized = quantized.reshape(img_array.shape)
-        
-        # Convert back to PIL Image
         posterized_img = Image.fromarray(quantized)
         
         # Resize back to original dimensions
         posterized_img = posterized_img.resize((original_w, original_h), Image.Resampling.NEAREST)
         
-        # Save to bytes
+        # Save optimized output
         img_io = io.BytesIO()
         posterized_img.save(img_io, format='PNG', optimize=True)
         img_io.seek(0)
@@ -321,17 +325,15 @@ def posterize_svg(request):
             img = img.convert('RGB')
         
         # Resize for processing if image is too large
-        img = resize_image_for_processing(img, max_dimension=400)  # Further reduced max dimension
+        img = resize_image_for_processing(img, max_dimension=800)
         w, h = img.size
         
         # Calculate pixelated dimensions
         small_w = max(1, w // pixel_size)
         small_h = max(1, h // pixel_size)
-        
-        # Resize for pixelation
         small_img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
         
-        # Convert to numpy array and process colors
+        # Process colors
         img_array = np.array(small_img)
         pixels = img_array.reshape(-1, 3)
         pixels = np.float32(pixels)
@@ -341,44 +343,82 @@ def posterize_svg(request):
         flags = cv2.KMEANS_RANDOM_CENTERS
         _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
         
-        # Convert back to uint8
         palette = np.uint8(palette)
         quantized = palette[labels.flatten()]
         quantized = quantized.reshape(img_array.shape)
         
-        # Initialize SVG with minimal content
+        # Initialize SVG
         svg_parts = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
         
-        # Process image row by row and combine identical adjacent pixels
+        # Create efficient grid representation
+        grid = {}
         for y in range(quantized.shape[0]):
-            run_start = 0
-            current_color = tuple(quantized[y, 0])
+            for x in range(quantized.shape[1]):
+                color = tuple(quantized[y, x])
+                if color not in grid:
+                    grid[color] = []
+                grid[color].append((x, y))
+        
+        # Process each color group
+        for color, pixels in grid.items():
+            if not pixels:
+                continue
+                
+            # Sort pixels by position for better merging
+            pixels.sort(key=lambda p: (p[1], p[0]))  # Sort by y, then x
             
-            for x in range(1, quantized.shape[1]):
-                pixel_color = tuple(quantized[y, x])
-                if pixel_color != current_color:
-                    # End of a run of identical colors
-                    if run_start < x - 1:  # If run is longer than 1 pixel
+            # Find rectangular regions
+            regions = []
+            current_region = [pixels[0], pixels[0]]  # [top-left, bottom-right]
+            last_pixel = pixels[0]
+            
+            for pixel in pixels[1:]:
+                x, y = pixel
+                
+                # Check if pixel continues current region
+                if (x == last_pixel[0] + 1 and y == last_pixel[1]):  # Same row
+                    current_region[1] = pixel  # Extend right
+                    last_pixel = pixel
+                elif (x == current_region[0][0] and  # Start of new row
+                      y == last_pixel[1] + 1 and
+                      x + (current_region[1][0] - current_region[0][0]) <= quantized.shape[1]):
+                    # Verify the entire row matches
+                    row_matches = True
+                    for check_x in range(current_region[0][0], current_region[1][0] + 1):
+                        if tuple(quantized[y, check_x]) != color:
+                            row_matches = False
+                            break
+                    
+                    if row_matches:
+                        current_region[1] = (current_region[1][0], y)  # Extend down
+                        last_pixel = (current_region[1][0], y)
+                    else:
+                        regions.append(current_region)
+                        current_region = [pixel, pixel]
+                        last_pixel = pixel
+                else:
+                    regions.append(current_region)
+                    current_region = [pixel, pixel]
+                    last_pixel = pixel
+            
+            regions.append(current_region)
+            
+            # Add color group to SVG
+            if regions:
+                svg_parts.append(f'<g fill="rgb{color}">')
+                for (x1, y1), (x2, y2) in regions:
+                    width = (x2 - x1 + 1) * pixel_size
+                    height = (y2 - y1 + 1) * pixel_size
+                    if width > 0 and height > 0:
                         svg_parts.append(
-                            f'<rect x="{run_start*pixel_size}" y="{y*pixel_size}" '
-                            f'width="{(x-run_start)*pixel_size}" height="{pixel_size}" '
-                            f'fill="rgb{current_color}"/>'
+                            f'<rect x="{x1*pixel_size}" y="{y1*pixel_size}"'
+                            f' width="{width}" height="{height}"/>'
                         )
-                    run_start = x
-                    current_color = pixel_color
-            
-            # Handle the last run in the row
-            if run_start < quantized.shape[1]:
-                svg_parts.append(
-                    f'<rect x="{run_start*pixel_size}" y="{y*pixel_size}" '
-                    f'width="{(quantized.shape[1]-run_start)*pixel_size}" '
-                    f'height="{pixel_size}" fill="rgb{current_color}"/>'
-                )
+                svg_parts.append('</g>')
         
         svg_parts.append('</svg>')
         svg_string = ''.join(svg_parts)
         
-        # Create response with proper headers
         response = HttpResponse(
             content=svg_string,
             content_type='image/svg+xml; charset=utf-8'
