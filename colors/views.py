@@ -10,7 +10,12 @@ from sklearn.cluster import KMeans
 from sklearn.utils import shuffle
 import tempfile
 import os
+<<<<<<< HEAD
 from django.shortcuts import render
+=======
+import io
+from rest_framework.response import Response
+>>>>>>> 9d995fe (new feature)
 
 def extract_colors(image, num_colors=10):
     # Resize image to speed up processing
@@ -164,5 +169,363 @@ class UploadMediaView(APIView):
         except Exception as e:
             return JsonResponse({"error": str(e)}, status=400)
 
+<<<<<<< HEAD
 def home(request):
     return render(request, 'home.html')
+=======
+def resize_image_for_processing(img, max_dimension=1200):
+    """Resize image while maintaining aspect ratio if it's too large"""
+    w, h = img.size
+    if max(w, h) > max_dimension:
+        ratio = max_dimension / max(w, h)
+        new_size = (int(w * ratio), int(h * ratio))
+        return img.resize(new_size, Image.Resampling.LANCZOS)
+    return img
+
+@api_view(['POST'])
+def posterize_image(request):
+    if 'file' not in request.FILES:
+        return Response({'error': 'No file uploaded'}, status=400)
+    
+    try:
+        file = request.FILES['file']
+        pixel_size = int(request.POST.get('pixelSize', 8))
+        num_colors = int(request.POST.get('numColors', 8))
+        
+        # Open and process image
+        original_img = Image.open(file)
+        if original_img.mode != 'RGB':
+            original_img = original_img.convert('RGB')
+        
+        # Store original dimensions
+        original_w, original_h = original_img.size
+        
+        # Resize for processing if image is too large
+        img = resize_image_for_processing(original_img)
+        w, h = img.size
+        
+        # Calculate resize ratios
+        w_ratio = original_w / w
+        h_ratio = original_h / h
+        
+        # Adjust pixel size based on ratio
+        adjusted_pixel_size = max(2, int(pixel_size / min(w_ratio, h_ratio)))
+        
+        # Create posterized version
+        small_w = max(1, w // adjusted_pixel_size)
+        small_h = max(1, h // adjusted_pixel_size)
+        img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        
+        # Convert to numpy array for color quantization
+        img_array = np.array(img)
+        pixels = img_array.reshape(-1, 3)
+        pixels = np.float32(pixels)
+        
+        # Perform k-means clustering
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+        flags = cv2.KMEANS_RANDOM_CENTERS
+        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
+        
+        # Convert back to uint8
+        palette = np.uint8(palette)
+        quantized = palette[labels.flatten()]
+        quantized = quantized.reshape(img_array.shape)
+        
+        # Convert back to PIL Image
+        posterized_img = Image.fromarray(quantized)
+        
+        # Resize back to original dimensions
+        posterized_img = posterized_img.resize((original_w, original_h), Image.Resampling.NEAREST)
+        
+        # Save to bytes
+        img_io = io.BytesIO()
+        posterized_img.save(img_io, format='PNG', optimize=True)
+        img_io.seek(0)
+        
+        return HttpResponse(img_io, content_type='image/png')
+        
+    except Exception as e:
+        print(f"Error in posterize_image: {str(e)}")
+        return Response({'error': str(e)}, status=500)
+
+@api_view(['POST'])
+def posterize_svg(request):
+    if 'file' not in request.FILES:
+        return Response({'error': 'No file uploaded'}, status=400)
+    
+    try:
+        file = request.FILES['file']
+        pixel_size = int(request.POST.get('pixelSize', 8))
+        num_colors = int(request.POST.get('numColors', 8))
+        
+        # Open and process image
+        img = Image.open(file)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize for processing if image is too large
+        img = resize_image_for_processing(img, max_dimension=400)  # Further reduced max dimension
+        w, h = img.size
+        
+        # Calculate pixelated dimensions
+        small_w = max(1, w // pixel_size)
+        small_h = max(1, h // pixel_size)
+        
+        # Resize for pixelation
+        small_img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        
+        # Convert to numpy array and process colors
+        img_array = np.array(small_img)
+        pixels = img_array.reshape(-1, 3)
+        pixels = np.float32(pixels)
+        
+        # Perform k-means clustering
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+        flags = cv2.KMEANS_RANDOM_CENTERS
+        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
+        
+        # Convert back to uint8
+        palette = np.uint8(palette)
+        quantized = palette[labels.flatten()]
+        quantized = quantized.reshape(img_array.shape)
+        
+        # Initialize SVG with minimal content
+        svg_parts = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
+        
+        # Process image row by row and combine identical adjacent pixels
+        for y in range(quantized.shape[0]):
+            run_start = 0
+            current_color = tuple(quantized[y, 0])
+            
+            for x in range(1, quantized.shape[1]):
+                pixel_color = tuple(quantized[y, x])
+                if pixel_color != current_color:
+                    # End of a run of identical colors
+                    if run_start < x - 1:  # If run is longer than 1 pixel
+                        svg_parts.append(
+                            f'<rect x="{run_start*pixel_size}" y="{y*pixel_size}" '
+                            f'width="{(x-run_start)*pixel_size}" height="{pixel_size}" '
+                            f'fill="rgb{current_color}"/>'
+                        )
+                    run_start = x
+                    current_color = pixel_color
+            
+            # Handle the last run in the row
+            if run_start < quantized.shape[1]:
+                svg_parts.append(
+                    f'<rect x="{run_start*pixel_size}" y="{y*pixel_size}" '
+                    f'width="{(quantized.shape[1]-run_start)*pixel_size}" '
+                    f'height="{pixel_size}" fill="rgb{current_color}"/>'
+                )
+        
+        svg_parts.append('</svg>')
+        svg_string = ''.join(svg_parts)
+        
+        # Create response with proper headers
+        response = HttpResponse(
+            content=svg_string,
+            content_type='image/svg+xml; charset=utf-8'
+        )
+        response['Content-Disposition'] = 'attachment; filename="posterized-image.svg"'
+        return response
+        
+    except Exception as e:
+        print(f"Error in posterize_svg: {str(e)}")
+        return Response({'error': str(e)}, status=500)
+
+@api_view(['POST'])
+def convert_to_line_art(request):
+    if 'file' not in request.FILES:
+        return Response({'error': 'No file uploaded'}, status=400)
+    
+    try:
+        file = request.FILES['file']
+        threshold = int(request.POST.get('threshold', 127))
+        blur_radius = int(request.POST.get('blurRadius', 0))
+        
+        # Open and process image
+        original_img = Image.open(file)
+        if original_img.mode != 'RGB':
+            original_img = original_img.convert('RGB')
+        
+        # Store original dimensions
+        original_w, original_h = original_img.size
+        
+        # Resize for processing if image is too large
+        img = resize_image_for_processing(original_img)
+        
+        # Convert to numpy array
+        img_array = np.array(img)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        if blur_radius > 0:
+            gray = cv2.GaussianBlur(gray, (blur_radius * 2 + 1, blur_radius * 2 + 1), 0)
+        
+        # Apply edge detection
+        edges = cv2.Canny(gray, threshold/2, threshold)
+        
+        # Invert the image
+        edges = 255 - edges
+        
+        # Convert back to PIL Image
+        line_art = Image.fromarray(edges)
+        
+        # Resize back to original dimensions
+        line_art = line_art.resize((original_w, original_h), Image.Resampling.LANCZOS)
+        
+        # Save to bytes with optimization
+        img_io = io.BytesIO()
+        line_art.save(img_io, format='PNG', optimize=True)
+        img_io.seek(0)
+        
+        return HttpResponse(img_io, content_type='image/png')
+        
+    except Exception as e:
+        print(f"Error in convert_to_line_art: {str(e)}")
+        return Response({'error': str(e)}, status=500)
+
+@api_view(['POST'])
+def convert_to_line_art_svg(request):
+    if 'file' not in request.FILES:
+        return Response({'error': 'No file uploaded'}, status=400)
+    
+    try:
+        file = request.FILES['file']
+        threshold = int(request.POST.get('threshold', 127))
+        blur_radius = int(request.POST.get('blurRadius', 0))
+        
+        # Open and process image
+        img = Image.open(file)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Get dimensions
+        w, h = img.size
+        
+        # Convert to numpy array
+        img_array = np.array(img)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # Optional: Apply Gaussian blur to reduce noise
+        if blur_radius > 0:
+            gray = cv2.GaussianBlur(gray, (blur_radius * 2 + 1, blur_radius * 2 + 1), 0)
+        
+        # Apply edge detection
+        edges = cv2.Canny(gray, threshold/2, threshold)
+        
+        # Create SVG content
+        svg_content = ['<?xml version="1.0" encoding="UTF-8"?>']
+        svg_content.append(f'<svg width="{w}" height="{h}" xmlns="http://www.w3.org/2000/svg">')
+        svg_content.append(f'<rect width="{w}" height="{h}" fill="white"/>')
+        
+        # Convert edges to SVG paths
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in contours:
+            if len(contour) > 1:
+                path = "M"
+                for point in contour:
+                    x, y = point[0]
+                    path += f" {x},{y}"
+                path += "Z"
+                svg_content.append(f'<path d="{path}" stroke="black" fill="none" stroke-width="1"/>')
+        
+        svg_content.append('</svg>')
+        
+        # Join all lines
+        svg_string = '\n'.join(svg_content)
+        
+        # Return SVG response
+        response = HttpResponse(svg_string, content_type='image/svg+xml')
+        response['Content-Disposition'] = 'attachment; filename="line-art.svg"'
+        return response
+        
+    except Exception as e:
+        print(f"Error in convert_to_line_art_svg: {str(e)}")
+        return Response({'error': str(e)}, status=500)
+
+@api_view(['POST'])
+def blend_art(request):
+    if 'file' not in request.FILES:
+        return Response({'error': 'No file uploaded'}, status=400)
+    
+    try:
+        file = request.FILES['file']
+        pixel_size = int(request.POST.get('pixelSize', 8))
+        num_colors = int(request.POST.get('numColors', 8))
+        threshold = int(request.POST.get('threshold', 127))
+        blur_radius = int(request.POST.get('blurRadius', 0))
+        
+        # Open and process image
+        original_img = Image.open(file)
+        if original_img.mode != 'RGB':
+            original_img = original_img.convert('RGB')
+        
+        # Store original dimensions
+        original_w, original_h = original_img.size
+        
+        # Resize for processing
+        img = resize_image_for_processing(original_img)
+        w, h = img.size
+        
+        # Calculate resize ratios
+        w_ratio = original_w / w
+        h_ratio = original_h / h
+        
+        # Adjust pixel size based on ratio
+        adjusted_pixel_size = max(2, int(pixel_size / min(w_ratio, h_ratio)))
+        
+        # Process at reduced size
+        small_w = max(1, w // adjusted_pixel_size)
+        small_h = max(1, h // adjusted_pixel_size)
+        
+        # Create posterized version
+        posterized = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        posterized = posterized.resize((w, h), Image.Resampling.NEAREST)
+        
+        # Process posterized image
+        img_array = np.array(posterized)
+        pixels = img_array.reshape(-1, 3)
+        pixels = np.float32(pixels)
+        
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+        flags = cv2.KMEANS_RANDOM_CENTERS
+        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
+        
+        palette = np.uint8(palette)
+        quantized = palette[labels.flatten()]
+        quantized = quantized.reshape(img_array.shape)
+        
+        # Create line art
+        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
+        
+        if blur_radius > 0:
+            gray = cv2.GaussianBlur(gray, (blur_radius * 2 + 1, blur_radius * 2 + 1), 0)
+        
+        edges = cv2.Canny(gray, threshold/2, threshold)
+        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        
+        # Blend
+        mask = edges_rgb == 255
+        result = quantized.copy()
+        result[mask] = 0
+        
+        # Convert to PIL and resize to original dimensions
+        blended_img = Image.fromarray(result)
+        blended_img = blended_img.resize((original_w, original_h), Image.Resampling.NEAREST)
+        
+        # Save with optimization
+        img_io = io.BytesIO()
+        blended_img.save(img_io, format='PNG', optimize=True)
+        img_io.seek(0)
+        
+        return HttpResponse(img_io, content_type='image/png')
+        
+    except Exception as e:
+        print(f"Error in blend_art: {str(e)}")
+        return Response({'error': str(e)}, status=500)
+>>>>>>> 9d995fe (new feature)

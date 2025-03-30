@@ -138,8 +138,18 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+<<<<<<< HEAD
 
 # Add STATIC_ROOT for production
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Allow all frontend origins (not recommended for production)
+=======
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "https://colorchef.onrender.com",
+]
+
+# For development
+CORS_ALLOW_ALL_ORIGINS = True
+>>>>>>> 9d995fe (new feature)
