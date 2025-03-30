@@ -19,50 +19,69 @@ import math
 logger = logging.getLogger(__name__)
 
 def extract_colors(image, num_colors=10):
-    # Resize image to speed up processing
-    max_size = 200
-    orig_width, orig_height = image.size
-    scale = min(max_size/orig_width, max_size/orig_height)
-    
-    if scale < 1:
-        new_width = int(orig_width * scale)
-        new_height = int(orig_height * scale)
-        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    try:
+        # Resize image to speed up processing
+        max_size = 200
+        orig_width, orig_height = image.size
+        scale = min(max_size/orig_width, max_size/orig_height)
+        
+        if scale < 1:
+            new_width = int(orig_width * scale)
+            new_height = int(orig_height * scale)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-    # Convert PIL image to NumPy array
-    image_array = np.array(image)
-    
-    # Reshape and sample pixels
-    pixels = image_array.reshape(-1, 3)
-    pixel_positions = np.array([(i % image_array.shape[1], i // image_array.shape[1]) 
-                               for i in range(len(pixels))])
-    
-    # Sample pixels if too many
-    if len(pixels) > 10000:
-        indices = np.random.choice(len(pixels), 10000, replace=False)
-        pixels = pixels[indices]
-        pixel_positions = pixel_positions[indices]
+        # Convert PIL image to NumPy array
+        image_array = np.array(image)
+        
+        # Ensure image is in RGB format
+        if len(image_array.shape) != 3 or image_array.shape[2] != 3:
+            raise ValueError("Image must be in RGB format")
+        
+        # Reshape and sample pixels
+        pixels = image_array.reshape(-1, 3)
+        pixel_positions = np.array([(i % image_array.shape[1], i // image_array.shape[1]) 
+                                  for i in range(len(pixels))])
+        
+        # Sample pixels if too many
+        if len(pixels) > 10000:
+            indices = np.random.choice(len(pixels), 10000, replace=False)
+            pixels = pixels[indices]
+            pixel_positions = pixel_positions[indices]
 
-    # Use KMeans clustering
-    kmeans = KMeans(n_clusters=num_colors, n_init=1)
-    labels = kmeans.fit_predict(pixels)
-    centers = kmeans.cluster_centers_
+        # Use KMeans clustering with error handling
+        try:
+            kmeans = KMeans(n_clusters=min(num_colors, len(pixels)), n_init=1)
+            labels = kmeans.fit_predict(pixels)
+            centers = kmeans.cluster_centers_
+        except Exception as e:
+            print(f"KMeans error: {str(e)}")
+            # Fallback to simple color averaging if KMeans fails
+            centers = np.mean(pixels.reshape(-1, 3), axis=0).reshape(1, 3)
+            labels = np.zeros(len(pixels))
+            num_colors = 1
 
-    # Get sample positions for each cluster
-    color_regions = []
-    for i in range(num_colors):
-        cluster_pixels = pixel_positions[labels == i]
-        if len(cluster_pixels) > 0:
-            # Get center point of cluster
-            center_point = cluster_pixels.mean(axis=0)
-            color_regions.append({
-                'x': float(center_point[0] / image_array.shape[1]),  # Normalize to 0-1
-                'y': float(center_point[1] / image_array.shape[0])   # Normalize to 0-1
-            })
-        else:
-            color_regions.append({'x': 0.5, 'y': 0.5})  # Fallback center position
+        # Get sample positions for each cluster
+        color_regions = []
+        for i in range(min(num_colors, len(centers))):
+            cluster_pixels = pixel_positions[labels == i]
+            if len(cluster_pixels) > 0:
+                # Get center point of cluster
+                center_point = cluster_pixels.mean(axis=0)
+                color_regions.append({
+                    'x': float(center_point[0] / image_array.shape[1]),
+                    'y': float(center_point[1] / image_array.shape[0])
+                })
+            else:
+                color_regions.append({'x': 0.5, 'y': 0.5})
 
-    return centers.astype(int).tolist(), color_regions
+        return centers.astype(int).tolist(), color_regions
+
+    except Exception as e:
+        print(f"Error in extract_colors: {str(e)}")
+        # Return fallback colors if everything fails
+        fallback_colors = [[128, 128, 128]]  # Gray
+        fallback_regions = [{'x': 0.5, 'y': 0.5}]
+        return fallback_colors * num_colors, fallback_regions * num_colors
 
 def extract_colors_from_video(video_path, num_colors=10, total_colors=30, max_frames=15, start_time=0, end_time=5):
     try:
@@ -176,17 +195,17 @@ class UploadMediaView(APIView):
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
             else:
-                # Open and optimize image
+                # Open and process image
                 image = Image.open(file)
-                optimized_io = optimize_image_for_upload(image)
-                if optimized_io is None:
-                    return JsonResponse({"error": "Failed to process image"}, status=400)
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
                 
-                # Store optimized image in session or cache for later use
-                request.session['optimized_image'] = optimized_io.getvalue()
+                # Resize for processing if needed
+                if image.size[0] * image.size[1] > 1000000:  # If larger than 1MP
+                    process_w, process_h = get_optimal_dimensions(image.size[0], image.size[1])
+                    image = image.resize((process_w, process_h), Image.Resampling.LANCZOS)
                 
-                # Extract colors from optimized image
-                image = Image.open(optimized_io)
+                # Extract colors directly from the processed image
                 all_colors, all_regions = extract_colors(image, num_colors=total_colors)
                 
                 return JsonResponse({
@@ -562,58 +581,55 @@ def blend_art(request):
         if original_img.mode != 'RGB':
             original_img = original_img.convert('RGB')
         
-        # Store original dimensions
-        original_w, original_h = original_img.size
+        # Calculate optimal processing dimensions
+        if original_img.size[0] * original_img.size[1] > 1000000:  # If larger than 1MP
+            process_w, process_h = get_optimal_dimensions(original_img.size[0], original_img.size[1])
+            img = original_img.resize((process_w, process_h), Image.Resampling.LANCZOS)
+        else:
+            img = original_img
+            process_w, process_h = original_img.size[0], original_img.size[1]
         
-        # Resize for processing
-        img = resize_image_for_processing(original_img)
-        w, h = img.size
+        # Process at reduced size for faster computation
+        img_array = np.array(img)
         
-        # Calculate resize ratios
-        w_ratio = original_w / w
-        h_ratio = original_h / h
-        
-        # Adjust pixel size based on ratio
-        adjusted_pixel_size = max(2, int(pixel_size / min(w_ratio, h_ratio)))
-        
-        # Process at reduced size
-        small_w = max(1, w // adjusted_pixel_size)
-        small_h = max(1, h // adjusted_pixel_size)
-        
-        # Create posterized version
-        posterized = img.resize((small_w, small_h), Image.Resampling.NEAREST)
-        posterized = posterized.resize((w, h), Image.Resampling.NEAREST)
-        
-        # Process posterized image
-        img_array = np.array(posterized)
-        pixels = img_array.reshape(-1, 3)
-        pixels = np.float32(pixels)
-        
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
-        flags = cv2.KMEANS_RANDOM_CENTERS
-        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
-        
-        palette = np.uint8(palette)
-        quantized = palette[labels.flatten()]
-        quantized = quantized.reshape(img_array.shape)
-        
-        # Create line art
-        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
-        
+        # Create line art at reduced size
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
         if blur_radius > 0:
             gray = cv2.GaussianBlur(gray, (blur_radius * 2 + 1, blur_radius * 2 + 1), 0)
-        
         edges = cv2.Canny(gray, threshold/2, threshold)
+        
+        # Create posterized version at reduced size
+        small_w = max(1, process_w // pixel_size)
+        small_h = max(1, process_h // pixel_size)
+        small_img = cv2.resize(img_array, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Flatten and convert to float32 for k-means
+        pixels = small_img.reshape(-1, 3).astype(np.float32)
+        
+        # Perform k-means with optimized parameters
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, .1)
+        flags = cv2.KMEANS_RANDOM_CENTERS
+        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 3, flags)
+        
+        # Convert back to uint8 and reshape
+        palette = np.uint8(palette)
+        quantized = palette[labels.flatten()].reshape(small_img.shape)
+        
+        # Resize posterized image to match original
+        quantized = cv2.resize(quantized, (process_w, process_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Convert edges to 3 channels and resize
         edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
         
-        # Blend
+        # Optimize blending operation
         mask = edges_rgb == 255
         result = quantized.copy()
         result[mask] = 0
         
-        # Convert to PIL and resize to original dimensions
+        # Convert to PIL and resize if needed
         blended_img = Image.fromarray(result)
-        blended_img = blended_img.resize((original_w, original_h), Image.Resampling.NEAREST)
+        if process_w != original_img.size[0] or process_h != original_img.size[1]:
+            blended_img = blended_img.resize(original_img.size, Image.Resampling.NEAREST)
         
         # Save with optimization
         img_io = io.BytesIO()
