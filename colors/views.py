@@ -14,8 +14,6 @@ import io
 from rest_framework.response import Response
 from django.core.exceptions import ValidationError
 import logging
-from PIL import ImageOps
-import gc  # For garbage collection
 
 logger = logging.getLogger(__name__)
 
@@ -205,123 +203,71 @@ def validate_image(file):
     except Exception as e:
         raise ValidationError(f'Invalid image file: {str(e)}')
 
-def optimize_image_processing(img, max_dimension=1200):
-    """Optimize image for processing"""
-    # Convert to RGB if needed
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    
-    # Auto-contrast to improve color extraction
-    img = ImageOps.autocontrast(img, cutoff=0)
-    
-    # Resize if too large
-    w, h = img.size
-    if max(w, h) > max_dimension:
-        ratio = max_dimension / max(w, h)
-        new_size = (int(w * ratio), int(h * ratio))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-    
-    return img
-
-def process_posterize(img, pixel_size, num_colors):
-    """Process image for posterization with memory optimization"""
-    try:
-        # Optimize image first
-        img = optimize_image_processing(img)
-        original_size = img.size
-        
-        # Calculate dimensions
-        small_w = max(1, img.size[0] // pixel_size)
-        small_h = max(1, img.size[1] // pixel_size)
-        
-        # Reduce size for processing
-        small_img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
-        
-        # Free up original image memory
-        img = None
-        gc.collect()
-        
-        # Process in smaller chunks if image is large
-        chunk_size = 10000
-        img_array = np.array(small_img)
-        pixels = img_array.reshape(-1, 3)
-        
-        if len(pixels) > chunk_size:
-            # Process in chunks
-            indices = np.random.choice(len(pixels), chunk_size, replace=False)
-            sample_pixels = pixels[indices].astype(np.float32)
-            
-            # Perform clustering on sample
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
-            _, _, palette = cv2.kmeans(sample_pixels, num_colors, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-            
-            # Apply palette to all pixels
-            palette = np.uint8(palette)
-            distances = np.sqrt(((pixels[:, np.newaxis] - palette) ** 2).sum(axis=2))
-            labels = distances.argmin(axis=1)
-            quantized = palette[labels]
-        else:
-            # Process all pixels at once
-            pixels = pixels.astype(np.float32)
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
-            _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-            quantized = palette[labels.flatten()]
-        
-        # Reshape and create image
-        quantized = quantized.reshape(img_array.shape)
-        posterized_img = Image.fromarray(quantized)
-        
-        # Resize to original dimensions
-        posterized_img = posterized_img.resize(original_size, Image.Resampling.NEAREST)
-        
-        # Clean up
-        gc.collect()
-        
-        return posterized_img
-        
-    except Exception as e:
-        logger.error(f"Error in process_posterize: {str(e)}")
-        raise ValidationError(f"Failed to process image: {str(e)}")
-
 @api_view(['POST'])
 def posterize_image(request):
     if 'file' not in request.FILES:
-        logger.warning("No file in request")
         return Response({'error': 'No file uploaded'}, status=400)
     
     try:
         file = request.FILES['file']
-        img = validate_image(file)
+        pixel_size = int(request.POST.get('pixelSize', 8))
+        num_colors = int(request.POST.get('numColors', 8))
         
-        # Get and validate parameters
-        try:
-            pixel_size = int(request.POST.get('pixelSize', 8))
-            num_colors = int(request.POST.get('numColors', 8))
-            
-            if not (2 <= pixel_size <= 32):
-                raise ValidationError('Pixel size must be between 2 and 32')
-            if not (1 <= num_colors <= 256):
-                raise ValidationError('Number of colors must be between 1 and 256')
-        except ValueError:
-            raise ValidationError('Invalid parameters')
-
-        # Process image
-        logger.info(f"Processing image with pixel_size={pixel_size}, num_colors={num_colors}")
-        result_img = process_posterize(img, pixel_size, num_colors)
+        # Open and process image
+        original_img = Image.open(file)
+        if original_img.mode != 'RGB':
+            original_img = original_img.convert('RGB')
         
-        # Return result
+        # Store original dimensions
+        original_w, original_h = original_img.size
+        
+        # Resize for processing if image is too large
+        img = resize_image_for_processing(original_img)
+        w, h = img.size
+        
+        # Calculate resize ratios
+        w_ratio = original_w / w
+        h_ratio = original_h / h
+        
+        # Adjust pixel size based on ratio
+        adjusted_pixel_size = max(2, int(pixel_size / min(w_ratio, h_ratio)))
+        
+        # Create posterized version
+        small_w = max(1, w // adjusted_pixel_size)
+        small_h = max(1, h // adjusted_pixel_size)
+        img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+        
+        # Convert to numpy array for color quantization
+        img_array = np.array(img)
+        pixels = img_array.reshape(-1, 3)
+        pixels = np.float32(pixels)
+        
+        # Perform k-means clustering
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+        flags = cv2.KMEANS_RANDOM_CENTERS
+        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
+        
+        # Convert back to uint8
+        palette = np.uint8(palette)
+        quantized = palette[labels.flatten()]
+        quantized = quantized.reshape(img_array.shape)
+        
+        # Convert back to PIL Image
+        posterized_img = Image.fromarray(quantized)
+        
+        # Resize back to original dimensions
+        posterized_img = posterized_img.resize((original_w, original_h), Image.Resampling.NEAREST)
+        
+        # Save to bytes
         img_io = io.BytesIO()
-        result_img.save(img_io, format='PNG', optimize=True)
+        posterized_img.save(img_io, format='PNG', optimize=True)
         img_io.seek(0)
         
         return HttpResponse(img_io, content_type='image/png')
         
-    except ValidationError as e:
-        logger.warning(f"Validation error: {str(e)}")
-        return Response({'error': str(e)}, status=400)
     except Exception as e:
-        logger.error(f"Error in posterize_image: {str(e)}")
-        return Response({'error': 'An unexpected error occurred'}, status=500)
+        print(f"Error in posterize_image: {str(e)}")
+        return Response({'error': str(e)}, status=500)
 
 @api_view(['POST'])
 def posterize_svg(request):
