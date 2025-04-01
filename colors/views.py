@@ -272,54 +272,22 @@ def posterize_image(request):
         file = request.FILES['file']
         pixel_size = int(request.POST.get('pixelSize', 8))
         num_colors = int(request.POST.get('numColors', 8))
+        style = request.POST.get('style', 'classic')
         
-        # Open image
+        # Open and process image
         original_img = Image.open(file)
         if original_img.mode != 'RGB':
             original_img = original_img.convert('RGB')
         
-        # Store original dimensions
-        original_w, original_h = original_img.size
+        # Process based on style
+        if style == 'cartoon':
+            result_img = create_cartoon_effect(original_img, pixel_size, num_colors)
+        else:  # classic
+            result_img = create_classic_posterize(original_img, pixel_size, num_colors)
         
-        # Calculate optimal processing dimensions based on image size
-        if original_w * original_h > 1000000:  # If larger than 1MP
-            process_w, process_h = get_optimal_dimensions(original_w, original_h)
-            img = original_img.resize((process_w, process_h), Image.Resampling.LANCZOS)
-        else:
-            img = original_img
-            process_w, process_h = original_w, original_h
-        
-        # Adjust pixel size based on resize ratio
-        scale_factor = min(original_w / process_w, original_h / process_h)
-        adjusted_pixel_size = max(2, int(pixel_size / scale_factor))
-        
-        # Create posterized version
-        small_w = max(1, process_w // adjusted_pixel_size)
-        small_h = max(1, process_h // adjusted_pixel_size)
-        img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
-        
-        # Process colors
-        img_array = np.array(img)
-        pixels = img_array.reshape(-1, 3)
-        pixels = np.float32(pixels)
-        
-        # Perform k-means clustering
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
-        flags = cv2.KMEANS_RANDOM_CENTERS
-        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
-        
-        # Convert back to image
-        palette = np.uint8(palette)
-        quantized = palette[labels.flatten()]
-        quantized = quantized.reshape(img_array.shape)
-        posterized_img = Image.fromarray(quantized)
-        
-        # Resize back to original dimensions
-        posterized_img = posterized_img.resize((original_w, original_h), Image.Resampling.NEAREST)
-        
-        # Save optimized output
+        # Save output
         img_io = io.BytesIO()
-        posterized_img.save(img_io, format='PNG', optimize=True)
+        result_img.save(img_io, format='PNG', optimize=True)
         img_io.seek(0)
         
         return HttpResponse(img_io, content_type='image/png')
@@ -327,6 +295,143 @@ def posterize_image(request):
     except Exception as e:
         print(f"Error in posterize_image: {str(e)}")
         return Response({'error': str(e)}, status=500)
+
+def create_cartoon_effect(img, pixel_size, num_colors):
+    """Creates a flat, cartoon-like effect with smooth outlines and vibrant colors"""
+    # Resize for processing
+    img = resize_image_for_processing(img)
+    img_array = np.array(img)
+    
+    # Apply bilateral filter to smooth while preserving edges
+    bilateral = cv2.bilateralFilter(img_array, 15, 80, 80)
+    
+    # Convert to LAB color space for better color separation
+    lab_image = cv2.cvtColor(bilateral, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab_image)
+    
+    # Enhance color channels
+    a = cv2.add(a, 2)
+    b = cv2.add(b, 2)
+    lab_enhanced = cv2.merge([l, a, b])
+    
+    # Color quantization in LAB space
+    pixels = lab_enhanced.reshape(-1, 3)
+    pixels = np.float32(pixels)
+    
+    # Color clustering with enhanced saturation
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, .95)
+    _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags=cv2.KMEANS_PP_CENTERS)
+    
+    # Convert back to image space
+    palette = np.uint8(palette)
+    quantized = palette[labels.flatten()].reshape(lab_enhanced.shape)
+    quantized = cv2.cvtColor(quantized, cv2.COLOR_LAB2RGB)
+    
+    # Enhance saturation
+    hsv = cv2.cvtColor(quantized, cv2.COLOR_RGB2HSV)
+    h, s, v = cv2.split(hsv)
+    s = cv2.add(s, 30)
+    v = cv2.add(v, 10)
+    quantized = cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2RGB)
+    
+    # Multi-stage edge detection for smoother lines
+    gray = cv2.cvtColor(bilateral, cv2.COLOR_RGB2GRAY)
+    
+    # Get dark regions
+    _, dark_mask = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+    
+    # Detect edges using multiple methods
+    edges_canny = cv2.Canny(gray, 50, 150)
+    
+    # Detect significant edges using Sobel
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    edges_sobel = np.sqrt(sobelx**2 + sobely**2)
+    edges_sobel = np.uint8(np.clip(edges_sobel * 255 / edges_sobel.max(), 0, 255))
+    
+    # Combine edges
+    edges = cv2.addWeighted(edges_canny, 0.7, edges_sobel, 0.3, 0)
+    edges = cv2.bitwise_and(edges, dark_mask)
+    
+    # Smooth and clean edges
+    kernel = np.ones((2, 2), np.uint8)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    edges = cv2.GaussianBlur(edges, (3, 3), 0.5)
+    _, edges = cv2.threshold(edges, 50, 255, cv2.THRESH_BINARY)
+    
+    # Process contours for smoother lines
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
+    edges = np.zeros_like(edges)
+    
+    for contour in contours:
+        if cv2.contourArea(contour) > 20:
+            # Smooth the contour
+            epsilon = 0.002 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            # Draw smooth lines
+            cv2.drawContours(edges, [approx], -1, 255, 1, cv2.LINE_AA)
+    
+    # Final edge smoothing
+    edges = cv2.GaussianBlur(edges, (3, 3), 0.5)
+    
+    # Create edge mask
+    edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+    edges_rgb = cv2.bitwise_not(edges_rgb)
+    
+    # Combine quantized image with edges
+    result = cv2.bitwise_and(quantized, edges_rgb)
+    
+    # Final color enhancement
+    lab_result = cv2.cvtColor(result, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab_result)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    l = clahe.apply(l)
+    result = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
+    
+    return Image.fromarray(result)
+
+def create_classic_posterize(img, pixel_size, num_colors):
+    """The original posterization effect"""
+    # Store original dimensions
+    original_w, original_h = img.size
+    
+    # Calculate optimal processing dimensions based on image size
+    if original_w * original_h > 1000000:  # If larger than 1MP
+        process_w, process_h = get_optimal_dimensions(original_w, original_h)
+        img = img.resize((process_w, process_h), Image.Resampling.LANCZOS)
+    else:
+        process_w, process_h = original_w, original_h
+    
+    # Adjust pixel size based on resize ratio
+    scale_factor = min(original_w / process_w, original_h / process_h)
+    adjusted_pixel_size = max(2, int(pixel_size / scale_factor))
+    
+    # Create posterized version
+    small_w = max(1, process_w // adjusted_pixel_size)
+    small_h = max(1, process_h // adjusted_pixel_size)
+    img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+    
+    # Process colors
+    img_array = np.array(img)
+    pixels = img_array.reshape(-1, 3)
+    pixels = np.float32(pixels)
+    
+    # Perform k-means clustering
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+    flags = cv2.KMEANS_RANDOM_CENTERS
+    _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
+    
+    # Convert back to image
+    palette = np.uint8(palette)
+    quantized = palette[labels.flatten()]
+    quantized = quantized.reshape(img_array.shape)
+    posterized_img = Image.fromarray(quantized)
+    
+    # Resize back to original dimensions
+    posterized_img = posterized_img.resize((original_w, original_h), Image.Resampling.NEAREST)
+    
+    return posterized_img
 
 @api_view(['POST'])
 def posterize_svg(request):
@@ -337,113 +442,210 @@ def posterize_svg(request):
         file = request.FILES['file']
         pixel_size = int(request.POST.get('pixelSize', 8))
         num_colors = int(request.POST.get('numColors', 8))
+        style = request.POST.get('style', 'classic')
         
         # Open and process image
         img = Image.open(file)
         if img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Resize for processing if image is too large
-        img = resize_image_for_processing(img, max_dimension=800)
-        w, h = img.size
-        
-        # Calculate pixelated dimensions
-        small_w = max(1, w // pixel_size)
-        small_h = max(1, h // pixel_size)
-        small_img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
-        
-        # Process colors
-        img_array = np.array(small_img)
-        pixels = img_array.reshape(-1, 3)
-        pixels = np.float32(pixels)
-        
-        # Perform k-means clustering
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
-        flags = cv2.KMEANS_RANDOM_CENTERS
-        _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags)
-        
-        palette = np.uint8(palette)
-        quantized = palette[labels.flatten()]
-        quantized = quantized.reshape(img_array.shape)
-        
-        # Initialize SVG
-        svg_parts = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
-        
-        # Create efficient grid representation
-        grid = {}
-        for y in range(quantized.shape[0]):
-            for x in range(quantized.shape[1]):
-                color = tuple(quantized[y, x])
-                if color not in grid:
-                    grid[color] = []
-                grid[color].append((x, y))
-        
-        # Process each color group
-        for color, pixels in grid.items():
-            if not pixels:
-                continue
-                
-            # Sort pixels by position for better merging
-            pixels.sort(key=lambda p: (p[1], p[0]))  # Sort by y, then x
+        if style == 'cartoon':
+            img_array = np.array(img)
+            bilateral = cv2.bilateralFilter(img_array, 15, 80, 80)
             
-            # Find rectangular regions
-            regions = []
-            current_region = [pixels[0], pixels[0]]  # [top-left, bottom-right]
-            last_pixel = pixels[0]
+            # Convert to LAB color space for better color separation
+            lab_image = cv2.cvtColor(bilateral, cv2.COLOR_RGB2LAB)
+            pixels = lab_image.reshape(-1, 3)
+            pixels = np.float32(pixels)
             
-            for pixel in pixels[1:]:
-                x, y = pixel
+            # Color clustering with better parameters
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, .95)
+            _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags=cv2.KMEANS_PP_CENTERS)
+            
+            # Start SVG
+            w, h = img.size
+            svg_parts = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">',
+                f'<rect width="{w}" height="{h}" fill="white"/>'
+            ]
+            
+            # Convert colors to RGB and prepare masks
+            rgb_palette = cv2.cvtColor(np.uint8([palette]), cv2.COLOR_LAB2RGB)[0]
+            labels_2d = labels.reshape(img.size[::-1])
+            
+            # Process colors from darkest to lightest for better layering
+            color_brightnesses = [np.mean(color) for color in rgb_palette]
+            color_indices = np.argsort(color_brightnesses)
+            
+            # Add color regions with smart grouping
+            for color_idx in color_indices:
+                color = tuple(map(int, rgb_palette[color_idx]))
+                mask = (labels_2d == color_idx).astype(np.uint8) * 255
                 
-                # Check if pixel continues current region
-                if (x == last_pixel[0] + 1 and y == last_pixel[1]):  # Same row
-                    current_region[1] = pixel  # Extend right
-                    last_pixel = pixel
-                elif (x == current_region[0][0] and  # Start of new row
-                      y == last_pixel[1] + 1 and
-                      x + (current_region[1][0] - current_region[0][0]) <= quantized.shape[1]):
-                    # Verify the entire row matches
-                    row_matches = True
-                    for check_x in range(current_region[0][0], current_region[1][0] + 1):
-                        if tuple(quantized[y, check_x]) != color:
-                            row_matches = False
-                            break
+                # Dilate mask slightly to prevent gaps
+                kernel = np.ones((3,3), np.uint8)
+                mask = cv2.dilate(mask, kernel, iterations=1)
+                
+                # Find contours with hierarchy for better nesting
+                contours, hierarchy = cv2.findContours(
+                    mask, 
+                    cv2.RETR_CCOMP,  # Use connected components
+                    cv2.CHAIN_APPROX_SIMPLE
+                )
+                
+                if contours:
+                    # Group contours by their hierarchy
+                    outer_paths = []
+                    inner_paths = []
                     
-                    if row_matches:
-                        current_region[1] = (current_region[1][0], y)  # Extend down
-                        last_pixel = (current_region[1][0], y)
-                    else:
-                        regions.append(current_region)
-                        current_region = [pixel, pixel]
-                        last_pixel = pixel
-                else:
-                    regions.append(current_region)
-                    current_region = [pixel, pixel]
-                    last_pixel = pixel
-            
-            regions.append(current_region)
-            
-            # Add color group to SVG
-            if regions:
-                svg_parts.append(f'<g fill="rgb{color}">')
-                for (x1, y1), (x2, y2) in regions:
-                    width = (x2 - x1 + 1) * pixel_size
-                    height = (y2 - y1 + 1) * pixel_size
-                    if width > 0 and height > 0:
+                    for i, cnt in enumerate(contours):
+                        if cv2.contourArea(cnt) < 10:  # Skip tiny areas
+                            continue
+                            
+                        # Smooth contour with adaptive epsilon
+                        area = cv2.contourArea(cnt)
+                        epsilon = 0.001 * cv2.arcLength(cnt, True) * math.sqrt(1000 / (area + 1))
+                        approx = cv2.approxPolyDP(cnt, epsilon, True)
+                        points = approx.reshape(-1, 2)
+                        
+                        if len(points) > 2:
+                            # Create path with optimized coordinates
+                            path = f"M {points[0][0]:.1f},{points[0][1]:.1f}"
+                            for x, y in points[1:]:
+                                path += f"L {x:.1f},{y:.1f}"
+                            path += "Z"
+                            
+                            # Add to appropriate group based on hierarchy
+                            if hierarchy[0][i][3] == -1:  # Outer contour
+                                outer_paths.append(path)
+                            else:  # Inner contour (hole)
+                                inner_paths.append(path)
+                    
+                    if outer_paths or inner_paths:
+                        # Combine paths with fill-rule for proper rendering
                         svg_parts.append(
-                            f'<rect x="{x1*pixel_size}" y="{y1*pixel_size}"'
-                            f' width="{width}" height="{height}"/>'
+                            f'<path fill="rgb({color[0]},{color[1]},{color[2]})" '
+                            f'fill-rule="evenodd" '
+                            f'd="{" ".join(outer_paths + inner_paths)}"/>'
                         )
-                svg_parts.append('</g>')
         
-        svg_parts.append('</svg>')
-        svg_string = ''.join(svg_parts)
-        
-        response = HttpResponse(
-            content=svg_string,
-            content_type='image/svg+xml; charset=utf-8'
-        )
-        response['Content-Disposition'] = 'attachment; filename="posterized-image.svg"'
-        return response
+            # Add edges with better processing
+            gray = cv2.cvtColor(bilateral, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 100, 200)
+            
+            # Process edges with better grouping
+            svg_parts.append('<g fill="none" stroke="black" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">')
+            
+            # Find and process edge contours
+            edge_contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_KCOS)
+            
+            for cnt in edge_contours:
+                if cv2.contourArea(cnt) > 20:
+                    # Adaptive smoothing based on contour size
+                    area = cv2.contourArea(cnt)
+                    epsilon = 0.002 * cv2.arcLength(cnt, True) * math.sqrt(1000 / (area + 1))
+                    approx = cv2.approxPolyDP(cnt, epsilon, True)
+                    points = approx.reshape(-1, 2)
+                    
+                    if len(points) > 2:
+                        # Create optimized path
+                        path = f"M {points[0][0]:.1f},{points[0][1]:.1f}"
+                        path += "".join([f"L {x:.1f},{y:.1f}" for x, y in points[1:]])
+                        if cv2.arcLength(cnt, True) > 0:
+                            path += "Z"
+                        svg_parts.append(f'<path d="{path}"/>')
+            
+            svg_parts.append('</g>')
+            svg_parts.append('</svg>')
+            
+            # Create optimized SVG string
+            svg_string = '\n'.join(svg_parts)
+            
+            response = HttpResponse(svg_string, content_type='image/svg+xml')
+            response['Content-Disposition'] = 'attachment; filename="cartoon-art.svg"'
+            return response
+        else:
+            # classic posterize style
+            w, h = img.size
+            small_w = max(1, w // pixel_size)
+            small_h = max(1, h // pixel_size)
+            small_img = img.resize((small_w, small_h), Image.Resampling.NEAREST)
+            
+            # Process colors
+            img_array = np.array(small_img)
+            pixels = img_array.reshape(-1, 3)
+            pixels = np.float32(pixels)
+            
+            # Color clustering
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 200, .1)
+            _, labels, palette = cv2.kmeans(pixels, num_colors, None, criteria, 10, flags=cv2.KMEANS_RANDOM_CENTERS)
+            
+            # Start SVG
+            svg_parts = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">',
+                f'<rect width="{w}" height="{h}" fill="white"/>'
+            ]
+            
+            # Convert labels back to 2D
+            labels_2d = labels.reshape(small_h, small_w)
+            
+            # Process each color region more efficiently
+            for color_idx in range(num_colors):
+                color = tuple(map(int, palette[color_idx]))
+                color_mask = (labels_2d == color_idx)
+                
+                if not np.any(color_mask):
+                    continue
+                
+                # Find runs of same-colored pixels
+                runs = []
+                for y in range(small_h):
+                    run_start = None
+                    for x in range(small_w + 1):
+                        if x < small_w and color_mask[y, x]:
+                            if run_start is None:
+                                run_start = x
+                        elif run_start is not None:
+                            runs.append((y, run_start, x))
+                            run_start = None
+                
+                # Merge vertical runs
+                merged_rects = []
+                if runs:
+                    current_rect = [runs[0][0], runs[0][1], runs[0][2], runs[0][0]]
+                    
+                    for y, start_x, end_x in runs[1:]:
+                        if (y == current_rect[3] + 1 and 
+                            start_x == current_rect[1] and 
+                            end_x == current_rect[2]):
+                            # Extend current rectangle
+                            current_rect[3] = y
+                        else:
+                            # Add current rectangle and start new one
+                            merged_rects.append(current_rect)
+                            current_rect = [y, start_x, end_x, y]
+                    
+                    merged_rects.append(current_rect)
+                
+                # Create SVG elements for this color
+                if merged_rects:
+                    svg_parts.append(f'<g fill="rgb({color[0]},{color[1]},{color[2]}">')
+                    for y_start, x_start, x_end, y_end in merged_rects:
+                        x = x_start * pixel_size
+                        y = y_start * pixel_size
+                        width = (x_end - x_start) * pixel_size
+                        height = (y_end - y_start + 1) * pixel_size
+                        svg_parts.append(f'<rect x="{x}" y="{y}" width="{width}" height="{height}"/>')
+                    svg_parts.append('</g>')
+            
+            svg_parts.append('</svg>')
+            svg_string = '\n'.join(svg_parts)
+            
+            response = HttpResponse(svg_string, content_type='image/svg+xml')
+            response['Content-Disposition'] = 'attachment; filename="posterized-classic.svg"'
+            return response
         
     except Exception as e:
         print(f"Error in posterize_svg: {str(e)}")
