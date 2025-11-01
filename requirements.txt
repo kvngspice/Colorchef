@@ -15,8 +15,8 @@ colorama==0.4.6
 colorthief==0.2.1
 dj-database-url==2.3.0
 Django==4.2.9
-django-cors-headers==3.14.0
-djangorestframework==4.3.1
+django-cors-headers==4.3.1
+djangorestframework==3.14.0
 djangorestframework_simplejwt==5.4.0
 et_xmlfile==2.0.0
 exceptiongroup==1.2.2
