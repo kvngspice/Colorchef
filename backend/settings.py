@@ -27,7 +27,7 @@ SECRET_KEY = 'django-insecure-=&=#^l2tc!dhc#s714q_v$04u!9sb8@6h%cdqni^wkik$74ti+
 DEBUG = os.environ.get('DJANGO_DEBUG', 'False') != 'False'
 
 ALLOWED_HOSTS = [
-    'colorchef.onrender.com',
+    'colorchef-87pc.onrender.com',
     'localhost',
     '127.0.0.1',
 ]
